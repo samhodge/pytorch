@@ -131,36 +131,33 @@ IValue toIValue(py::handle obj, const TypePtr& type, c10::optional<int32_t> N) {
     }
     case TypeKind::ClassType: {
       auto classType = type->expect<ClassType>();
-      if (auto mod = as_module(py::cast<py::object>(obj))) {
+      auto object = py::cast<py::object>(obj);
+      if (auto mod = as_module(object)) {
         // if obj is already a ScriptModule, just return its ivalue
         return mod.value()._ivalue();
       }
-      // otherwise is a normal class object, we create a fresh
-      // ivalue::Object to use from the py object.
-      // 1. create a bare ivalue
-      const size_t numAttrs = classType->numAttributes();
-      auto cu = classType->compilation_unit();
-      auto userObj = c10::ivalue::Object::create(
-          c10::StrongTypePtr(cu, classType), numAttrs);
 
-      // 2. copy all the contained types
-      for (size_t slot = 0; slot < numAttrs; slot++) {
-        const auto& attrType = classType->getAttribute(slot);
-        const auto& attrName = classType->getAttributeName(slot);
-
-        if (!py::hasattr(obj, attrName.c_str())) {
-          throw py::cast_error(c10::str(
-              "Tried to cast object to type ",
-              type->repr_str(),
-              " but object",
-              " was missing attribute ",
-              attrName));
-        }
-
-        const auto& contained = py::getattr(obj, attrName.c_str());
-        userObj->setSlot(slot, toIValue(contained, attrType));
+      // Check if the obj is a ScriptClass.
+      if (py::isinstance(
+              obj,
+              py::module::import("torch.jit").attr("RecursiveScriptClass"))) {
+        auto inst = py::cast<Object>(obj.attr("_c"));
+        return inst._ivalue();
       }
-      return userObj;
+
+      // Custom class?
+      try {
+        Object* script_object = object.cast<Object*>();
+        return script_object->_ivalue();
+      } catch (...) {
+        throw py::cast_error(c10::str(
+            "Object ",
+            py::str(obj),
+            " is not a TorchScript compatible type;"
+            " it must be scripted with torch.jit.script(instance)"
+            " before being passed as a value for an argument of type ",
+            type->repr_str()));
+      }
     }
     case TypeKind::InterfaceType: {
       auto interfaceType = type->expect<InterfaceType>();
@@ -172,6 +169,9 @@ IValue toIValue(py::handle obj, const TypePtr& type, c10::optional<int32_t> N) {
       if (auto mod = as_module(py::cast<py::object>(obj))) {
         classType = mod.value().type();
         res = mod.value()._ivalue();
+      } else if (auto object = as_object(py::cast<py::object>(obj))) {
+        classType = object.value().type();
+        res = object.value()._ivalue();
       } else {
         // We inspect the value to found the compiled TorchScript class
         // and then create a ivalue::Object from that class type.
@@ -193,8 +193,8 @@ IValue toIValue(py::handle obj, const TypePtr& type, c10::optional<int32_t> N) {
       std::stringstream why_not;
       if (!classType->isSubtypeOfExt(interfaceType, &why_not)) {
         throw py::cast_error(c10::str(
-            "Object ",
-            py::str(obj),
+            "Object of type ",
+            classType->repr_str(),
             " is not compatible with interface ",
             interfaceType->repr_str(),
             "\n",
